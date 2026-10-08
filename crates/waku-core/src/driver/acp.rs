@@ -121,6 +121,7 @@ impl AcpDriver {
             agent_preset: _,
             computer_use_enabled,
             provider_cursor,
+            extra_env,
         } = options;
         let fork_context = match &provider_cursor {
             Some(ProviderResumeCursor::Cursor { fork_context, .. }) => fork_context.clone(),
@@ -155,6 +156,7 @@ impl AcpDriver {
             &cwd,
             launch,
             computer_use.as_ref().map(|runtime| &runtime.config),
+            extra_env,
             stderr_lines.clone(),
         )?;
         let (commands, command_rx) = smol::channel::unbounded();
@@ -210,6 +212,7 @@ fn sdk_agent(
     cwd: &Path,
     mut launch: AcpLaunch,
     computer_use: Option<&super::support::HeadlessComputerUseConfig>,
+    extra_env: Vec<(String, String)>,
     stderr_lines: Arc<Mutex<Vec<String>>>,
 ) -> anyhow::Result<AcpAgent> {
     let binary = binary
@@ -232,6 +235,7 @@ fn sdk_agent(
         .collect::<Vec<_>>();
     environment.append(&mut launch.env);
     environment.extend(computer_env);
+    environment.extend(extra_env);
 
     // `AcpAgentConfig` deliberately contains only argv and environment. macOS
     // `env -C` supplies the session cwd without a shell, preserving exact
@@ -265,7 +269,14 @@ pub(crate) fn catalog_agent(
     cwd: &Path,
 ) -> anyhow::Result<AcpAgent> {
     let launch = launch_for(provider, None)?;
-    sdk_agent(binary, cwd, launch, None, Arc::new(Mutex::new(Vec::new())))
+    sdk_agent(
+        binary,
+        cwd,
+        launch,
+        None,
+        Vec::new(),
+        Arc::new(Mutex::new(Vec::new())),
+    )
 }
 
 type PermissionResponder = Responder<RequestPermissionResponse>;
@@ -2636,6 +2647,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                extra_env: Vec::new(),
             },
             events,
         )
@@ -2689,6 +2701,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                extra_env: Vec::new(),
             },
             events,
         )
@@ -2747,6 +2760,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                extra_env: Vec::new(),
             },
             events,
         )

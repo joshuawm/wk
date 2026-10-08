@@ -216,6 +216,7 @@ impl PiDriver {
             agent_preset: _,
             computer_use_enabled,
             provider_cursor,
+            extra_env,
         } = options;
         if mode != RuntimeMode::FullAccess {
             return Err(anyhow!(
@@ -270,6 +271,9 @@ impl PiDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in &extra_env {
+            command.env(name, value);
+        }
         let mut child = crate::command_env::spawn(command)
             .with_context(|| format!("failed to start `{} --mode rpc`", binary.display()))?;
         let stdin = child
@@ -1761,6 +1765,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                extra_env: Vec::new(),
             },
             events,
         )
@@ -2008,6 +2013,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                extra_env: Vec::new(),
             },
             events,
         )

@@ -192,6 +192,9 @@ pub struct DriverStartOptions {
     pub agent_preset: Option<String>,
     pub computer_use_enabled: bool,
     pub provider_cursor: Option<ProviderResumeCursor>,
+    /// Extra environment variables a host injects into the provider process.
+    /// Every driver applies these right before spawning.
+    pub extra_env: Vec<(String, String)>,
 }
 
 /// The subset of `DriverStartOptions` a user can change without starting a new
@@ -206,7 +209,7 @@ pub struct SessionOptions {
     pub context_window: Option<String>,
 }
 
-pub(crate) fn start_local(
+pub fn start_local(
     provider: ProviderKind,
     mut options: DriverStartOptions,
     events: DriverEventSender,

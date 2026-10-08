@@ -222,6 +222,7 @@ impl CodexDriver {
             agent_preset: _,
             computer_use_enabled,
             provider_cursor,
+            extra_env,
         } = options;
         let provider_session_id = match provider_cursor {
             Some(ProviderResumeCursor::Codex { thread_id }) => Some(thread_id),
@@ -255,6 +256,9 @@ impl CodexDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in &extra_env {
+            command.env(name, value);
+        }
         let mut child =
             crate::command_env::spawn(command).context("failed to start `codex app-server`")?;
 
@@ -2509,6 +2513,7 @@ mod tests {
                     agent_preset: None,
                     computer_use_enabled: false,
                     provider_cursor: Some(cursor),
+                    extra_env: Vec::new(),
                 },
                 events,
             )
@@ -2594,6 +2599,7 @@ mod tests {
                     agent_preset: None,
                     computer_use_enabled: false,
                     provider_cursor: cursor,
+                    extra_env: Vec::new(),
                 },
                 events,
             )

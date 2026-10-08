@@ -179,6 +179,7 @@ impl ClaudeDriver {
             agent_preset: _,
             computer_use_enabled: _,
             provider_cursor,
+            extra_env,
         } = options;
         let (resume_session_id, resume_at) = match provider_cursor {
             Some(ProviderResumeCursor::Claude {
@@ -219,6 +220,9 @@ impl ClaudeDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in &extra_env {
+            command.env(name, value);
+        }
         let mut child = crate::command_env::spawn(command)
             .context("failed to start `claude` in streaming-input mode")?;
         let stdin = child
@@ -1890,6 +1894,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                extra_env: Vec::new(),
             },
             events,
         )
@@ -1958,6 +1963,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                extra_env: Vec::new(),
             },
             events,
         )

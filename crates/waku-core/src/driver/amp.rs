@@ -95,6 +95,7 @@ impl AmpDriver {
             agent_preset: _,
             computer_use_enabled: _,
             provider_cursor,
+            extra_env,
         } = options;
         if mode != RuntimeMode::FullAccess {
             return Err(anyhow!("Amp currently supports Full access only"));
@@ -127,6 +128,9 @@ impl AmpDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in &extra_env {
+            command.env(name, value);
+        }
         let mut child = crate::command_env::spawn(command)
             .context("failed to start `amp` in streaming-input mode")?;
         let stdin = child
@@ -572,6 +576,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                extra_env: Vec::new(),
             },
             events,
         )
@@ -630,6 +635,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                extra_env: Vec::new(),
             },
             events,
         )
