@@ -313,6 +313,19 @@ impl Store {
         .unwrap_or_default()
     }
 
+    pub fn load_task_result(&self, context_id: &str, task_id: i64) -> Option<String> {
+        self.with(|db| {
+            db.query_row(
+                "SELECT result_text FROM tasks WHERE context_id = ? AND id = ?",
+                [context_id, &task_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or(Ok(None))
+        })
+        .unwrap_or(None)
+    }
+
     pub fn load_requests(&self) -> Vec<RequestRow> {
         self.with(|db| {
             let mut statement = db.prepare(

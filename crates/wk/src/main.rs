@@ -64,6 +64,7 @@ const VALUE_FLAGS: &[&str] = &[
     "owner",
     "reply",
     "answer",
+    "task",
 ];
 
 const SWITCHES: &[&str] = &["json", "all"];

@@ -401,11 +401,15 @@ fn serve_connection(shared: Shared, stream: UnixStream, home: PathBuf) -> anyhow
             rpc::Incoming::Notification { .. } | rpc::Incoming::Response { .. } => continue,
             rpc::Incoming::Request { id, method, params } => {
                 let outcome = handle_request(&shared, &stream, &id, &method, params);
-                if outcome == Flow::Disconnect {
-                    break;
-                }
+                // `daemon/shutdown` responds with Flow::Disconnect; trigger the
+                // accept-loop break BEFORE honouring that disconnect, or the
+                // daemon would keep serving with `shutting_down` set and every
+                // later driver pump would die on its first event.
                 if method == "daemon/shutdown" {
                     request_shutdown();
+                    break;
+                }
+                if outcome == Flow::Disconnect {
                     break;
                 }
             }
@@ -515,12 +519,27 @@ fn dispatch(
             Ok(Flow::Continue)
         }
         "tasks/result" => {
-            let ctx = ctx_mut(state, param_context(&params)?.as_str())?;
-            let text = ctx
-                .task
-                .as_ref()
-                .map(|task| task.result.clone())
-                .unwrap_or_default();
+            let context_id = param_context(&params)?;
+            // Validate the context exists even when --task addresses the store.
+            let _ = ctx_mut(state, context_id.as_str())?;
+            let requested = params
+                .get("taskId")
+                .and_then(Value::as_str)
+                .and_then(|task| task.strip_prefix('t'))
+                .and_then(|task| task.parse::<i64>().ok());
+            let text = if let Some(task) = requested {
+                // An explicit --task T reads the stored result of that turn.
+                state
+                    .store
+                    .load_task_result(context_id.as_str(), task)
+                    .unwrap_or_default()
+            } else {
+                let ctx = ctx_mut(state, context_id.as_str())?;
+                ctx.task
+                    .as_ref()
+                    .map(|task| task.result.clone())
+                    .unwrap_or_default()
+            };
             send_raw(stream, &rpc::response(id.clone(), json!({ "text": text })));
             Ok(Flow::Continue)
         }
