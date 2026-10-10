@@ -9826,6 +9826,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "dirs",
+ "dunce",
+ "getrandom 0.3.4",
  "libc",
  "rusqlite",
  "serde",
@@ -9833,6 +9836,7 @@ dependencies = [
  "smol",
  "waku-core",
  "waku-protocol",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

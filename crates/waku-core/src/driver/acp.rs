@@ -237,14 +237,27 @@ fn sdk_agent(
     environment.extend(computer_env);
     environment.extend(extra_env);
 
-    // `AcpAgentConfig` deliberately contains only argv and environment. macOS
-    // `env -C` supplies the session cwd without a shell, preserving exact
-    // argument boundaries and the SDK's process-group lifecycle management.
-    let mut args = vec!["-C".to_owned(), cwd.to_owned(), binary.to_owned()];
-    args.extend(launch.args);
-    let config = AcpAgentConfig::new("/usr/bin/env")
-        .args(args)
-        .envs(environment);
+    // `AcpAgentConfig` deliberately contains only argv and environment, so on
+    // unix the session cwd rides in through `env -C`, which supplies it
+    // without a shell and preserves exact argument boundaries. On Windows
+    // there is no `/usr/bin/env`; the agent binary is spawned directly and the
+    // session cwd reaches it through the ACP `session/new` request, which
+    // carries cwd explicitly.
+    #[cfg(unix)]
+    let config = {
+        let mut args = vec!["-C".to_owned(), cwd.to_owned(), binary.to_owned()];
+        args.extend(launch.args);
+        AcpAgentConfig::new("/usr/bin/env")
+            .args(args)
+            .envs(environment)
+    };
+    #[cfg(windows)]
+    let config = {
+        let _ = &cwd;
+        AcpAgentConfig::new(binary)
+            .args(launch.args)
+            .envs(environment)
+    };
     Ok(AcpAgent::new(config).with_debug(move |line, direction| {
         if direction != LineDirection::Stderr || line.trim().is_empty() {
             return;

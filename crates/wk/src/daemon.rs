@@ -1,5 +1,5 @@
-//! `wkd` — the resident daemon (§2, §8). Owns all driver state behind a unix
-//! socket; the `wk` CLI is a stateless client.
+//! `wkd` — the resident daemon (§2, §8). Owns all driver state behind a local
+//! IPC endpoint (unix socket / named pipe); the `wk` CLI is a stateless client.
 //!
 //! Borrow discipline: every handler stages what it needs from a context in a
 //! scoped block, then touches the store, then mutates the context, then calls
@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::io::BufReader;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +20,7 @@ use waku_core::model::{
     UserInputAnswer, UserInputQuestion,
 };
 
+use crate::ipc::{self, IpcListener, IpcStream};
 use crate::process::{ensure_home, log_line, socket_path};
 use crate::rpc;
 use crate::store::{self, Store};
@@ -34,7 +34,7 @@ const OWNER_GRACE: Duration = Duration::from_secs(60);
 const OWNER_POLL: Duration = Duration::from_secs(5);
 
 type Shared = Arc<Mutex<DaemonState>>;
-type SharedStream = Arc<Mutex<UnixStream>>;
+type SharedStream = Arc<Mutex<IpcStream>>;
 
 #[derive(Clone)]
 enum Payload {
@@ -176,15 +176,27 @@ static STATE: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
 // entry point
 
 pub fn run() -> anyhow::Result<()> {
+    let result = run_inner();
+    // The detached daemon has no std streams (spawn_detached_daemon starts it
+    // with zero inherited handles), so a failed startup would otherwise be
+    // invisible; land it in wkd.log.
+    if let Err(error) = &result {
+        crate::process::log_line(&crate::process::wk_home(), &format!("wkd failed to start: {error}"));
+    }
+    result
+}
+
+fn run_inner() -> anyhow::Result<()> {
     let home = ensure_home()?;
     let lock = crate::process::acquire_lock(&home)?;
     let socket = socket_path(&home);
 
-    // A connectable socket means a live daemon; a stale file is ours to remove.
-    if socket.exists() && UnixStream::connect(&socket).is_ok() {
+    // A connectable endpoint means a live daemon; a stale socket file is ours
+    // to remove (a pipe name never goes stale — the kernel owns it).
+    if ipc::endpoint_is_live(&socket) {
         anyhow::bail!("another wkd is already serving {}", socket.display());
     }
-    let _ = std::fs::remove_file(&socket);
+    ipc::remove_stale_endpoint(&socket);
 
     let store = Store::open(&home.join("state.db"))?;
     let mut state = DaemonState {
@@ -198,7 +210,7 @@ pub fn run() -> anyhow::Result<()> {
     };
     recover_from_restart(&mut state);
 
-    let listener = crate::process::bind_socket(&socket)?;
+    let mut listener = IpcListener::bind(&socket)?;
     log_line(&home, &format!("wkd listening on {}", socket.display()));
 
     // Capture the login-shell environment off the accept path; drivers spawn
@@ -219,8 +231,8 @@ pub fn run() -> anyhow::Result<()> {
 
     loop {
         match listener.accept() {
-            Ok((stream, _)) => {
-                if !crate::process::peer_uid_is_self(&stream) {
+            Ok(stream) => {
+                if !stream.peer_is_self() {
                     log_line(&home, "rejected connection from a different uid");
                     continue;
                 }
@@ -246,7 +258,7 @@ pub fn run() -> anyhow::Result<()> {
 pub fn request_shutdown() {
     SHUTDOWN.store(true, Ordering::SeqCst);
     if let Some(home) = ensure_home().ok() {
-        let _ = UnixStream::connect(socket_path(&home));
+        let _ = IpcStream::connect(&socket_path(&home));
     }
 }
 
@@ -386,7 +398,7 @@ fn recover_from_restart(state: &mut DaemonState) {
 // ---------------------------------------------------------------------------
 // connection handling
 
-fn serve_connection(shared: Shared, stream: UnixStream, home: PathBuf) -> anyhow::Result<()> {
+fn serve_connection(shared: Shared, stream: IpcStream, home: PathBuf) -> anyhow::Result<()> {
     let stream: SharedStream = Arc::new(Mutex::new(stream));
     let clone = stream
         .lock()
@@ -1719,7 +1731,7 @@ fn respond_waiter_error(waiter: &Waiter, message: &str, code: &str) {
 
 fn send_raw(stream: &SharedStream, line: &str) {
     if let Ok(mut stream) = stream.lock() {
-        rpc::write_line(&mut stream, line);
+        rpc::write_line(&mut *stream, line);
     }
 }
 

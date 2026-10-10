@@ -18,10 +18,11 @@
 - 需要安装真实的 coding agent CLIs
 - 测试用户需要有有效的认证/订阅
 
-### Windows 支持（计划中）
-- 当前 `wk` crate 不支持 Windows
-- 需要先实现 Windows 支持才能在 Windows 上测试
-- 可能需要命名管道替代 unix socket
+### Windows 支持(已完成,2026-10-11)
+- `wk` crate 已原生支持 Windows(命名管道 IPC + `CreateProcessW` 守护化),
+  见 [wk-windows.md](wk-windows.md)
+- Windows 真实 E2E:`target/wk-e2e-real/run-real-windows.sh`
+  (claude 21/21、grok 5/5;codex 待其后端连通后补跑)
 
 ## 测试策略
 
@@ -115,8 +116,8 @@ wk-e2e-real/
    - [ ] 测试 Codex 特有功能（steer）
 
 4. **Phase 4: Windows 支持**
-   - [ ] 实现 `wk` crate 的 Windows 支持
-   - [ ] 移植测试到 Windows
+   - [x] 实现 `wk` crate 的 Windows 支持(2026-10-11,见 [wk-windows.md](wk-windows.md))
+   - [x] 移植测试到 Windows(`run-e2e-windows.sh` / `run-real-windows.sh`)
 
 ## 关键差异总结
 

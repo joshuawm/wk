@@ -210,3 +210,21 @@ export WK=$HOME/wk-target/debug/wk
 建议保留 fake 测试用于快速开发迭代，real 测试用于发布前的完整验证。
 
 **下一步**：安装 Codex 和 OpenCode CLI，实现其专项测试，然后开始 Windows 支持工作。
+
+---
+
+## Windows 真实 E2E(2026-10-11)
+
+`wk` crate 移植 Windows 后,新增 `target/wk-e2e-real/run-real-windows.sh`
+(Git Bash)。断言只看状态迁移与标记词,消耗真实配额。
+
+| provider | 结果 | 覆盖 |
+|---|---|---|
+| claude | 21/21 | basic、读文件、续话、daemon stop→重启持久化、permission allow/deny(--mode ask 下用 Write 触发;echo 等只读命令会被策略/沙箱自动放行,不产生请求)、auto 自批、timeout(12)、cancel(130)、depth、Windows 路径(dunce,无 `\?\`) |
+| grok | 5/5 | basic(ACP)、cancel |
+| codex | 未跑 | CLI 可用,但当天 codex 后端在本机持续 `Reconnecting...`(代理环境,standalone `codex exec` 同样复现),非 wk 缺陷 |
+
+fake 层(同日):`run-e2e-windows.sh` 93/93(T11 SIGINT 设计性 SKIP,
+待 Windows Terminal 手动 Ctrl+C 验证);unix 回归 fake 94/94。
+
+细节与实现约束见 [wk-windows.md](wk-windows.md)。

@@ -4,11 +4,21 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+pub fn wk_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("WK_HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".wk")
+}
+
+#[cfg(unix)]
 pub fn wk_home() -> PathBuf {
     if let Some(home) = std::env::var_os("WK_HOME") {
         if !home.is_empty() {
@@ -20,6 +30,7 @@ pub fn wk_home() -> PathBuf {
     home
 }
 
+#[cfg(unix)]
 fn dirs_homedir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -29,12 +40,49 @@ fn dirs_homedir() -> PathBuf {
 pub fn ensure_home() -> anyhow::Result<PathBuf> {
     let home = wk_home();
     std::fs::create_dir_all(&home)?;
-    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    // Unix tightens the directory; on Windows the per-user profile directory
+    // is already ACL-protected against other users by default.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(home)
 }
 
+#[cfg(unix)]
 pub fn socket_path(home: &Path) -> PathBuf {
     home.join("wkd.sock")
+}
+
+/// Windows serves `wk` over a named pipe instead of a socket file. Pipe names
+/// live in a machine-wide namespace, so the home path is hashed into the name:
+/// separate `WK_HOME`s get separate daemons (concurrent E2E runs), and two
+/// users on one machine never collide. The spelling is normalized (lowercase,
+/// backslash separators, no trailing slash) so every way of writing the same
+/// path hashes the same on both the client and the daemon side.
+#[cfg(windows)]
+pub fn socket_path(home: &Path) -> PathBuf {
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+    let normalized = home
+        .to_string_lossy()
+        .to_lowercase()
+        .replace('/', "\\");
+    let normalized = normalized.trim_end_matches('\\');
+    let user: String = std::env::var("USERNAME")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let user = if user.is_empty() { "u".to_owned() } else { user };
+    PathBuf::from(format!(r"\\.\pipe\wkd-{user}-{:016x}", fnv1a64(normalized.as_bytes())))
 }
 
 pub fn lock_path(home: &Path) -> PathBuf {
@@ -45,8 +93,10 @@ pub fn log_path(home: &Path) -> PathBuf {
     home.join("wkd.log")
 }
 
-/// Hold an exclusive flock for the daemon's lifetime (§13).
+/// Hold an exclusive lock for the daemon's lifetime (§13).
+#[cfg(unix)]
 pub fn acquire_lock(home: &Path) -> anyhow::Result<File> {
+    use std::os::fd::AsRawFd;
     let file = File::create(lock_path(home))?;
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if ret != 0 {
@@ -55,53 +105,22 @@ pub fn acquire_lock(home: &Path) -> anyhow::Result<File> {
     Ok(file)
 }
 
-pub fn bind_socket(path: &Path) -> anyhow::Result<UnixListener> {
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
-}
-
-/// The socket only serves same-uid callers (§8): verify with getpeereid.
-pub fn peer_uid_is_self(stream: &std::os::unix::net::UnixStream) -> bool {
-    peer_uid(stream.as_raw_fd())
-        .map(|uid| uid == unsafe { libc::getuid() })
-        .unwrap_or(false)
-}
-
-pub fn peer_uid(fd: i32) -> std::io::Result<u32> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut uid: u32 = 0;
-        let mut gid: u32 = 0;
-        let ret = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(uid)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Linux has no getpeereid; SO_PEERCRED carries the same (uid, gid, pid).
-        let mut cred: libc::ucred = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        let ret = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                &mut cred as *mut _ as *mut libc::c_void,
-                &mut len,
+/// No flock on Windows: the lock file is opened with sharing disabled and the
+/// handle is held for the daemon's lifetime, so a second opener fails.
+#[cfg(windows)]
+pub fn acquire_lock(home: &Path) -> anyhow::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .share_mode(0)
+        .open(lock_path(home))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "another wkd holds the lock at {} ({error})",
+                lock_path(home).display()
             )
-        };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(cred.uid)
-    }
+        })
 }
 
 /// §2: 6-character base32 context ids.
@@ -124,10 +143,17 @@ pub fn new_context_id() -> String {
     id
 }
 
+#[cfg(unix)]
 fn read_random(buffer: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read;
     let mut file = File::open("/dev/urandom")?;
     file.read_exact(buffer)
+}
+
+#[cfg(windows)]
+fn read_random(buffer: &mut [u8]) -> std::io::Result<()> {
+    getrandom::fill(buffer)
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 /// §12: the daemon log records ids and state changes only.
@@ -148,6 +174,7 @@ pub fn log_line(home: &Path, message: &str) {
 
 /// §13: start the daemon detached — setsid plus a double fork, then exec
 /// `wk daemon run` with stdio redirected to the log (stdin from /dev/null).
+#[cfg(unix)]
 pub fn spawn_detached_daemon() -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let home = ensure_home()?;
@@ -190,4 +217,62 @@ pub fn spawn_detached_daemon() -> anyhow::Result<()> {
             .exec();
         libc::_exit(127);
     }
+}
+
+/// §13 on Windows: spawn `wk daemon run` detached. There is no fork/exec, so
+/// the spawn returns immediately and the detached child outlives this process.
+/// Spawn via raw `CreateProcessW` with `bInheritHandles=FALSE`. The std
+/// `Command` path must pass `bInheritHandles=TRUE` to deliver the log stdio,
+/// which copies every inheritable handle of the caller into the daemon —
+/// including a shell's command-substitution pipe, whose write end the daemon
+/// would then hold open forever (the caller's `$(...)` never sees EOF). With
+/// no inherited handles the daemon has no std streams at all; it opens
+/// wkd.log itself for logging (§12) and inherits the environment block
+/// (lpEnvironment=NULL), which is copied by the kernel, not via handles.
+/// DETACHED_PROCESS and CREATE_NO_WINDOW are mutually exclusive console
+/// flags; the new process group keeps this console's Ctrl+C away from the
+/// daemon.
+#[cfg(windows)]
+pub fn spawn_detached_daemon() -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+
+    let exe = std::env::current_exe()?;
+    ensure_home()?;
+    let mut cmd: Vec<u16> = std::ffi::OsStr::new(&format!("\"{}\" daemon run", exe.display()))
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmd.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0, // bInheritHandles = FALSE — see the doc comment
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        anyhow::bail!(
+            "failed to spawn daemon: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    unsafe {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    Ok(())
 }

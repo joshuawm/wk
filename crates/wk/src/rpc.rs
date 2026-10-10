@@ -1,11 +1,12 @@
 //! JSON-RPC 2.0 over NDJSON, shared by the `wk` client and `wkd`.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+use crate::ipc::IpcStream;
 
 /// Error codes carried in `error.data.code` (§8 of the spec).
 pub mod codes {
@@ -57,7 +58,7 @@ pub enum Incoming {
     Closed,
 }
 
-pub fn read_message(reader: &mut BufReader<UnixStream>) -> Incoming {
+pub fn read_message<R: BufRead>(reader: &mut R) -> Incoming {
     let mut line = String::new();
     match reader.read_line(&mut line) {
         Ok(0) => return Incoming::Closed,
@@ -102,7 +103,7 @@ pub fn read_message(reader: &mut BufReader<UnixStream>) -> Incoming {
     }
 }
 
-pub fn write_line(stream: &mut UnixStream, line: &str) -> bool {
+pub fn write_line<W: Write>(stream: &mut W, line: &str) -> bool {
     if stream.write_all(line.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
         return false;
     }
@@ -138,7 +139,7 @@ pub fn split_response(value: Value) -> Result<Value, RpcError> {
 /// until the response with the matching id arrives. Server notifications seen
 /// on the way are returned alongside.
 pub fn call(path: &std::path::Path, method: &str, params: Value) -> anyhow::Result<(Value, Vec<Value>)> {
-    let mut stream = UnixStream::connect(path)?;
+    let mut stream = IpcStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(600)))?;
     write_line(&mut stream, &request(1, method, params));
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -160,13 +161,13 @@ pub fn call(path: &std::path::Path, method: &str, params: Value) -> anyhow::Resu
 /// initial request only arrives at the next stop point (§6.2). The socket read
 /// timeout doubles as the poll tick for the signal flag, so it stays short.
 pub struct Waiter {
-    stream: UnixStream,
-    reader: BufReader<UnixStream>,
+    stream: IpcStream,
+    reader: BufReader<IpcStream>,
 }
 
 impl Waiter {
     pub fn connect(path: &std::path::Path) -> anyhow::Result<Self> {
-        let stream = UnixStream::connect(path)?;
+        let stream = IpcStream::connect(path)?;
         stream.set_read_timeout(Some(Duration::from_millis(250)))?;
         let clone = stream.try_clone()?;
         Ok(Self {

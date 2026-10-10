@@ -1,8 +1,9 @@
 //! `wk` — the stateless CLI client (§5 of the spec) plus the `daemon`
-//! subcommands. Everything the CLI knows comes from the daemon over the
-//! unix socket; the only local state is `$WK_HOME`.
+//! subcommands. Everything the CLI knows comes from the daemon over the local
+//! IPC endpoint; the only local state is `$WK_HOME`.
 
 mod daemon;
+mod ipc;
 mod owner;
 mod process;
 mod rpc;
@@ -10,7 +11,6 @@ mod store;
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,16 +30,34 @@ const EXIT_CANCELED: i32 = 130;
 
 static SIGNALED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 extern "C" fn on_signal(_sig: libc::c_int) {
     SIGNALED.store(true, Ordering::SeqCst);
 }
 
+#[cfg(unix)]
 fn install_signals() {
     unsafe {
         let handler = on_signal as extern "C" fn(libc::c_int) as usize;
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
         libc::signal(libc::SIGHUP, handler);
+    }
+}
+
+#[cfg(windows)]
+extern "system" fn on_console_ctrl(_ctrl: u32) -> i32 {
+    SIGNALED.store(true, Ordering::SeqCst);
+    1 // TRUE: suppress the default terminate so the cancel flow can run
+}
+
+#[cfg(windows)]
+fn install_signals() {
+    // Console control events stand in for SIGINT/SIGTERM: the handler only
+    // flips the flag, and the 250ms waiter poll drives the cancel-then-exit
+    // flow. CTRL_CLOSE still ends the process after the OS grace period.
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console_ctrl), 1);
     }
 }
 
@@ -184,7 +202,7 @@ fn dispatch(command: &str, rest: &[String]) -> i32 {
 
 fn socket_connect() -> anyhow::Result<PathBuf> {
     let path = process::socket_path(&process::wk_home());
-    UnixStream::connect(&path)?;
+    ipc::IpcStream::connect(&path)?;
     Ok(path)
 }
 
@@ -925,6 +943,14 @@ fn cmd_daemon(args: &Args) -> i32 {
         "stop" => match socket_connect() {
             Ok(path) => match call(&path, "daemon/shutdown", json!({})) {
                 Ok(_) => {
+                    // The reply lands before the daemon has released the
+                    // endpoint; a client racing right behind us would connect
+                    // to the half-dead daemon and get rejected. Wait for the
+                    // endpoint to actually go away (bounded).
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while socket_connect().is_ok() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     eprintln!("[wk] daemon stopped");
                     EXIT_OK
                 }
