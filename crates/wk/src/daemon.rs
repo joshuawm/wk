@@ -250,7 +250,7 @@ fn run_inner() -> anyhow::Result<()> {
         match listener.accept() {
             Ok(stream) => {
                 if ACTIVE_CONNECTIONS
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                         (active < MAX_CONNECTIONS).then_some(active + 1)
                     })
                     .is_err()
