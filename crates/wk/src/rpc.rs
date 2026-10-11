@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 
 use crate::ipc::IpcStream;
 
+/// Bound one NDJSON request before it reaches the daemon state machine.
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Error codes carried in `error.data.code` (§8 of the spec).
 pub mod codes {
     pub const UNKNOWN_CONTEXT: &str = "unknown-context";
@@ -74,6 +77,9 @@ pub fn read_message<R: BufRead>(reader: &mut R) -> Incoming {
         }
         Err(_) => return Incoming::Closed,
         Ok(_) => {}
+    }
+    if line.len() > MAX_MESSAGE_BYTES {
+        return Incoming::Closed;
     }
     let value: Value = match serde_json::from_str(line.trim()) {
         Ok(value) => value,
@@ -224,4 +230,31 @@ pub enum WaitEnd {
     Superseded,
     Signaled,
     Closed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn rejects_oversized_ndjson_messages() {
+        let mut input = Cursor::new(format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"params\":\"{}\"}}\n",
+            "x".repeat(MAX_MESSAGE_BYTES)
+        ));
+        assert!(matches!(read_message(&mut input), Incoming::Closed));
+    }
+
+    #[test]
+    fn accepts_messages_at_the_control_plane_limit() {
+        let prefix = "{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"params\":\"";
+        let suffix = "\"}\n";
+        let payload_len = MAX_MESSAGE_BYTES - prefix.len() - suffix.len();
+        let mut input = Cursor::new(format!("{prefix}{}{suffix}", "x".repeat(payload_len)));
+        assert!(matches!(
+            read_message(&mut input),
+            Incoming::Notification { .. }
+        ));
+    }
 }

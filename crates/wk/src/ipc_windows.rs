@@ -46,6 +46,7 @@ pub struct IpcStream {
     /// Duplicated handles share the pipe but not this field, so `try_clone`
     /// copies it — the same visibility a dup'd fd gets from SO_RCVTIMEO.
     timeout: Mutex<Option<Duration>>,
+    write_timeout: Mutex<Option<Duration>>,
 }
 
 fn wide(path: &Path) -> Vec<u16> {
@@ -122,6 +123,7 @@ impl IpcListener {
         let stream = IpcStream {
             file: unsafe { std::fs::File::from_raw_handle(handle as RawHandle) },
             timeout: Mutex::new(None),
+        write_timeout: Mutex::new(None),
         };
         // Serve the next connection from a fresh instance.
         self.handle = create_instance(&self.name, false)?;
@@ -155,6 +157,7 @@ impl IpcStream {
                 return Ok(IpcStream {
                     file: unsafe { std::fs::File::from_raw_handle(handle as RawHandle) },
                     timeout: Mutex::new(None),
+                    write_timeout: Mutex::new(None),
                 });
             }
             let error = unsafe { GetLastError() };
@@ -177,10 +180,16 @@ impl IpcStream {
         Ok(())
     }
 
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        *self.write_timeout.lock().expect("ipc write timeout lock") = timeout;
+        Ok(())
+    }
+
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(IpcStream {
             file: self.file.try_clone()?,
             timeout: Mutex::new(*self.timeout.lock().expect("ipc timeout lock")),
+            write_timeout: Mutex::new(*self.write_timeout.lock().expect("ipc write timeout lock")),
         })
     }
 
@@ -281,11 +290,16 @@ impl io::Write for IpcStream {
             }
         }
         let mut transferred: u32 = 0;
+        let timeout = *self.write_timeout.lock().expect("ipc write timeout lock");
         if unsafe {
-            GetOverlappedResultEx(handle, &overlapped, &mut transferred, INFINITE, 0)
+            GetOverlappedResultEx(handle, &overlapped, &mut transferred, wait_ms(timeout), 0)
         } != 0
         {
             return Ok(transferred as usize);
+        }
+        if unsafe { GetLastError() } == WAIT_TIMEOUT {
+            unsafe { CancelIoEx(handle, &overlapped) };
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
         }
         Err(io::Error::last_os_error())
     }

@@ -32,6 +32,8 @@ const DRIVER_IDLE_KEEP: i64 = 600;
 const DORMANT_AFTER: i64 = 1800;
 const OWNER_GRACE: Duration = Duration::from_secs(60);
 const OWNER_POLL: Duration = Duration::from_secs(5);
+const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONNECTIONS: usize = 64;
 
 type Shared = Arc<Mutex<DaemonState>>;
 type SharedStream = Arc<Mutex<IpcStream>>;
@@ -171,6 +173,16 @@ pub fn mode_name(mode: RuntimeMode) -> &'static str {
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static STATE: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
+static ACTIVE_CONNECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct ConnectionPermit;
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // entry point
@@ -232,18 +244,31 @@ fn run_inner() -> anyhow::Result<()> {
     loop {
         match listener.accept() {
             Ok(stream) => {
+                if ACTIVE_CONNECTIONS
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                        (active < MAX_CONNECTIONS).then_some(active + 1)
+                    })
+                    .is_err()
+                {
+                    log_line(&home, "rejected connection: connection limit reached");
+                    continue;
+                }
                 if !stream.peer_is_self() {
+                    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
                     log_line(&home, "rejected connection from a different uid");
                     continue;
                 }
                 let shared = shared.clone();
                 let home = home.clone();
-                std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name("wk-conn".into())
                     .spawn(move || {
+                        let _permit = ConnectionPermit;
                         let _ = serve_connection(shared, stream, home);
-                    })
-                    .ok();
+                    });
+                if spawned.is_err() {
+                    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+                }
             }
             Err(error) => log_line(&home, &format!("accept failed: {error}")),
         }
@@ -399,6 +424,7 @@ fn recover_from_restart(state: &mut DaemonState) {
 // connection handling
 
 fn serve_connection(shared: Shared, stream: IpcStream, home: PathBuf) -> anyhow::Result<()> {
+    stream.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT))?;
     let stream: SharedStream = Arc::new(Mutex::new(stream));
     let clone = stream
         .lock()

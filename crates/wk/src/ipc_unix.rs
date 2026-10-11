@@ -37,6 +37,10 @@ impl IpcStream {
         self.inner.set_read_timeout(timeout)
     }
 
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(timeout)
+    }
+
     pub fn try_clone(&self) -> io::Result<Self> {
         self.inner.try_clone().map(|inner| IpcStream { inner })
     }
