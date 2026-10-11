@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 over NDJSON, shared by the `wk` client and `wkd`.
 
 use std::io::{BufRead, BufReader, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -10,6 +10,7 @@ use crate::ipc::IpcStream;
 
 /// Bound one NDJSON request before it reaches the daemon state machine.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+static NEXT_CLIENT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Error codes carried in `error.data.code` (§8 of the spec).
 pub mod codes {
@@ -147,7 +148,9 @@ pub fn split_response(value: Value) -> Result<Value, RpcError> {
 pub fn call(path: &std::path::Path, method: &str, params: Value) -> anyhow::Result<(Value, Vec<Value>)> {
     let mut stream = IpcStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    write_line(&mut stream, &request(1, method, params));
+    let id = ((std::process::id() as u64) << 32)
+        | (NEXT_CLIENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff);
+    write_line(&mut stream, &request(id, method, params));
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut notifications = Vec::new();
     loop {
@@ -158,7 +161,10 @@ pub fn call(path: &std::path::Path, method: &str, params: Value) -> anyhow::Resu
                 notifications.push(json!({ "method": method, "params": params }));
             }
             Incoming::Request { .. } => continue,
-            Incoming::Response { value, .. } => return Ok((value, notifications)),
+            Incoming::Response { id: got, value } if got.as_u64() == Some(id) => {
+                return Ok((value, notifications))
+            }
+            Incoming::Response { .. } => continue,
         }
     }
 }

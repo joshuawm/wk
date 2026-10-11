@@ -5,7 +5,7 @@
 //! scoped block, then touches the store, then mutates the context, then calls
 //! into the driver — the store and `Ctx` never borrow each other.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +34,7 @@ const OWNER_GRACE: Duration = Duration::from_secs(60);
 const OWNER_POLL: Duration = Duration::from_secs(5);
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 64;
+const MAX_WAITERS_PER_CONTEXT: usize = 16;
 
 type Shared = Arc<Mutex<DaemonState>>;
 type SharedStream = Arc<Mutex<IpcStream>>;
@@ -115,7 +116,7 @@ struct Ctx {
     pending: Vec<PendingReq>,
     next_question: u32,
     next_permission: u32,
-    waiter: Option<Waiter>,
+    waiters: Vec<Waiter>,
     steering: bool,
     pending_prompt: Option<String>,
     owner_dead_since: Option<Instant>,
@@ -124,6 +125,8 @@ struct Ctx {
 struct DaemonState {
     store: Store,
     ctxs: HashMap<String, Ctx>,
+    response_cache: HashMap<String, String>,
+    response_order: VecDeque<String>,
     max_depth: i64,
     shutting_down: bool,
 }
@@ -214,6 +217,8 @@ fn run_inner() -> anyhow::Result<()> {
     let mut state = DaemonState {
         store,
         ctxs: HashMap::new(),
+        response_cache: HashMap::new(),
+        response_order: VecDeque::new(),
         max_depth: std::env::var("WK_MAX_DEPTH")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -322,7 +327,7 @@ fn recover_from_restart(state: &mut DaemonState) {
                 pending: Vec::new(),
                 next_question: 0,
                 next_permission: 0,
-                waiter: None,
+                waiters: Vec::new(),
                 steering: false,
                 pending_prompt: None,
                 owner_dead_since: None,
@@ -456,13 +461,8 @@ fn serve_connection(shared: Shared, stream: IpcStream, home: PathBuf) -> anyhow:
     // Connection gone: drop any waiter registered on it.
     if let Ok(mut state) = shared.lock() {
         for ctx in state.ctxs.values_mut() {
-            let same = ctx
-                .waiter
-                .as_ref()
-                .is_some_and(|waiter| Arc::ptr_eq(&waiter.stream, &stream));
-            if same {
-                ctx.waiter = None;
-            }
+            ctx.waiters
+                .retain(|waiter| !Arc::ptr_eq(&waiter.stream, &stream));
         }
     }
     log_line(&home, "connection ended");
@@ -492,10 +492,16 @@ fn handle_request(
             return Flow::Continue;
         }
     };
+    if let Some(response) = state.response_cache.get(&id.to_string()).cloned() {
+        send_raw(stream, &response);
+        return Flow::Continue;
+    }
     match dispatch(&mut state, stream, id, method, params) {
         Ok(flow) => flow,
         Err(error) => {
-            send_raw(stream, &rpc::error(id.clone(), &error.message, &error.code));
+            let response = rpc::error(id.clone(), &error.message, &error.code);
+            cache_response(&mut state, id, response.clone());
+            send_raw(stream, &response);
             Flow::Continue
         }
     }
@@ -510,14 +516,16 @@ fn dispatch(
 ) -> Result<Flow, rpc::RpcError> {
     match method {
         "daemon/ping" => {
-            send_raw(stream, &rpc::response(id.clone(), json!({ "version": 1 })));
+            send_response(state, stream, id, rpc::response(id.clone(), json!({ "version": 1 })));
             Ok(Flow::Continue)
         }
         "contexts/create" => {
             let context_id = context_create(state, &params)?;
-            send_raw(
+            send_response(
+                state,
                 stream,
-                &rpc::response(id.clone(), json!({ "contextId": context_id })),
+                id,
+                rpc::response(id.clone(), json!({ "contextId": context_id })),
             );
             Ok(Flow::Continue)
         }
@@ -534,12 +542,11 @@ fn dispatch(
             };
             {
                 let ctx = ctx_mut(state, &context_id)?;
-                supersede(ctx);
                 if at_stop_point(ctx) {
                     let status = current_status(ctx);
                     respond_waiter(&waiter, &status);
                 } else {
-                    ctx.waiter = Some(waiter);
+                    add_waiter(ctx, waiter);
                 }
             }
             Ok(Flow::Continue)
@@ -547,13 +554,13 @@ fn dispatch(
         "tasks/get" => {
             let ctx = ctx_mut(state, param_context(&params)?.as_str())?;
             let status = current_status(ctx);
-            send_raw(stream, &rpc::response(id.clone(), status));
+            send_response(state, stream, id, rpc::response(id.clone(), status));
             Ok(Flow::Continue)
         }
         "tasks/cancel" => {
             let context_id = param_context(&params)?;
             let status = task_cancel(state, &context_id);
-            send_raw(stream, &rpc::response(id.clone(), status));
+            send_response(state, stream, id, rpc::response(id.clone(), status));
             Ok(Flow::Continue)
         }
         "tasks/result" => {
@@ -578,7 +585,7 @@ fn dispatch(
                     .map(|task| task.result.clone())
                     .unwrap_or_default()
             };
-            send_raw(stream, &rpc::response(id.clone(), json!({ "text": text })));
+            send_response(state, stream, id, rpc::response(id.clone(), json!({ "text": text })));
             Ok(Flow::Continue)
         }
         "tasks/pending" => {
@@ -595,16 +602,18 @@ fn dispatch(
                     })
                 })
                 .collect();
-            send_raw(
+            send_response(
+                state,
                 stream,
-                &rpc::response(id.clone(), json!({ "requests": requests })),
+                id,
+                rpc::response(id.clone(), json!({ "requests": requests })),
             );
             Ok(Flow::Continue)
         }
         "contexts/close" => {
             let context_id = param_context(&params)?;
             context_close(state, &context_id);
-            send_raw(stream, &rpc::response(id.clone(), Value::Null));
+            send_response(state, stream, id, rpc::response(id.clone(), Value::Null));
             Ok(Flow::Continue)
         }
         "contexts/list" => {
@@ -629,15 +638,17 @@ fn dispatch(
                     })
                 })
                 .collect();
-            send_raw(
+            send_response(
+                state,
                 stream,
-                &rpc::response(id.clone(), json!({ "contexts": contexts })),
+                id,
+                rpc::response(id.clone(), json!({ "contexts": contexts })),
             );
             Ok(Flow::Continue)
         }
         "daemon/shutdown" => {
             shutdown(state);
-            send_raw(stream, &rpc::response(id.clone(), Value::Null));
+            send_response(state, stream, id, rpc::response(id.clone(), Value::Null));
             Ok(Flow::Disconnect)
         }
         _ => Err(rpc::RpcError {
@@ -753,7 +764,7 @@ fn context_create(state: &mut DaemonState, params: &Value) -> Result<String, rpc
             pending: Vec::new(),
             next_question: 0,
             next_permission: 0,
-            waiter: None,
+            waiters: Vec::new(),
             steering: false,
             pending_prompt: None,
             owner_dead_since: None,
@@ -1010,16 +1021,15 @@ fn message_send(
     };
     if wait {
         let ctx = ctx_mut(state, &context_id)?;
-        supersede(ctx);
         if at_stop_point(ctx) {
             let status = current_status(ctx);
             respond_waiter(&waiter, &status);
         } else {
-            ctx.waiter = Some(waiter);
+            add_waiter(ctx, waiter);
         }
     } else {
         let status = current_status(ctx_mut(state, &context_id)?);
-        send_raw(stream, &rpc::response(id.clone(), status));
+        send_response(state, stream, id, rpc::response(id.clone(), status));
     }
     Ok(())
 }
@@ -1245,7 +1255,8 @@ fn task_cancel(state: &mut DaemonState, context_id: &str) -> Value {
         Err(_) => Value::Null,
     };
     if let Ok(ctx) = ctx_mut(state, context_id) {
-        if let Some(waiter) = ctx.waiter.take() {
+        let waiters = std::mem::take(&mut ctx.waiters);
+        for waiter in waiters {
             respond_waiter(&waiter, &status);
         }
     }
@@ -1517,7 +1528,8 @@ fn pump_loop(
             DriverEvent::SteerRejected { reason, .. } => {
                 if let Some(ctx) = state.ctxs.get_mut(&context_id) {
                     ctx.steering = false;
-                    if let Some(waiter) = ctx.waiter.take() {
+                    let waiters = std::mem::take(&mut ctx.waiters);
+                    for waiter in waiters {
                         respond_waiter_error(
                             &waiter,
                             &format!("steer rejected: {reason}"),
@@ -1678,7 +1690,8 @@ fn settle(state: &mut DaemonState, context_id: &str) {
             .update_task_result(context_id, task.id, &result);
     }
     let status = current_status(ctx);
-    if let Some(waiter) = ctx.waiter.take() {
+    let waiters = std::mem::take(&mut ctx.waiters);
+    for waiter in waiters {
         respond_waiter(&waiter, &status);
     }
 }
@@ -1738,10 +1751,15 @@ fn next_command(ctx: &Ctx) -> String {
 // ---------------------------------------------------------------------------
 // waiters (§6)
 
-fn supersede(ctx: &mut Ctx) {
-    if let Some(old) = ctx.waiter.take() {
-        send_raw(&old.stream, &rpc::notification("waiter/superseded", json!({})));
+fn add_waiter(ctx: &mut Ctx, waiter: Waiter) {
+    if ctx.waiters.len() >= MAX_WAITERS_PER_CONTEXT {
+        let old = ctx.waiters.remove(0);
+        send_raw(
+            &old.stream,
+            &rpc::notification("waiter/superseded", json!({ "reason": "waiter-limit" })),
+        );
     }
+    ctx.waiters.push(waiter);
 }
 
 fn respond_waiter(waiter: &Waiter, status: &Value) {
@@ -1753,6 +1771,26 @@ fn respond_waiter(waiter: &Waiter, status: &Value) {
 
 fn respond_waiter_error(waiter: &Waiter, message: &str, code: &str) {
     send_raw(&waiter.stream, &rpc::error(waiter.id.clone(), message, code));
+}
+
+fn send_response(state: &mut DaemonState, stream: &SharedStream, id: &Value, response: String) {
+    cache_response(state, id, response.clone());
+    send_raw(stream, &response);
+}
+
+fn cache_response(state: &mut DaemonState, id: &Value, response: String) {
+    const MAX_CACHED_RESPONSES: usize = 256;
+    let key = id.to_string();
+    if state.response_cache.contains_key(&key) {
+        return;
+    }
+    state.response_cache.insert(key.clone(), response);
+    state.response_order.push_back(key);
+    while state.response_order.len() > MAX_CACHED_RESPONSES {
+        if let Some(old) = state.response_order.pop_front() {
+            state.response_cache.remove(&old);
+        }
+    }
 }
 
 fn send_raw(stream: &SharedStream, line: &str) {
