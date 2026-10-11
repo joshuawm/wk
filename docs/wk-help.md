@@ -53,7 +53,7 @@ $ wk run <provider> --mode MODE [PROMPT]
 
 | 参数 | 说明 |
 |---|---|
-| `<provider>` | `claude` `codex` `cursor` `deepseek` `fx` `grok` `kimi` `amp` `pi` `ohmypi`（`opencode` v1 暂不支持） |
+| `<provider>` | `claude` `codex` `cursor` `deepseek` `fx` `grok` `kimi` `amp` `pi` `ohmypi` `agy`（别名 `antigravity`；`opencode` v1 暂不支持） |
 | `--mode` | **必填**：`ask` \| `auto-accept-edits` \| `auto` \| `full-access`。不设默认值，避免隐式给 full access |
 | `--cwd DIR` | 工作目录，默认当前目录，存储时规范化为绝对路径，创建后不可变 |
 | `--model M` / `--effort E` | 透传给 provider |
@@ -189,3 +189,28 @@ $ wk run claude --mode auto "写个测试"
 - `state.db` 存有 prompt 与输出全文；目录 0700、文件 0600。
 - `--mode full-access` 必须显式传入，没有任何默认路径会到达它。
 - `wkd.log` 只记 id 和状态变化，不记 prompt 内容。
+
+## Antigravity（agy）
+
+`wk run agy` 驱动本机 `agy` CLI（二进制名 `agy`，须在 PATH 上）。`antigravity` 是同一 provider 的别名。协议是 agy 自己的 stream-json（`init` / `step_update` / `result`），不是 Claude 兼容格式。会话 ID 由 agy 在 `init` 里生成，driver 采纳后再用 `--conversation` 续聊。
+
+```console
+$ wk run agy --mode full-access "用一个词回答：黄色的水果"
+$ wk run agy --mode full-access --model gemini-3.1-pro-high "你是什么模型"
+$ wk send <ctx> "上一句我问了什么"    # 上一 turn 已结束时续聊
+```
+
+| `--mode` | 传给 agy | 实际行为 |
+|---|---|---|
+| `ask` | `--sandbox` | 会话能结束，但 response 经常是空的。纯问答用 `full-access` |
+| `auto-accept-edits` / `auto` / `full-access` | `--dangerously-skip-permissions` | print 模式没有交互式授权，这三档都跳过权限提示 |
+
+`--model`、`--effort` 原样透传。effort 用 agy 的 `low` / `medium` / `high` / `xhigh` / `max`。模型列表来自 `agy models`（`id<TAB>显示名`，推理档位写在 id 后缀里，例如 `gemini-3.1-pro-high`）。
+
+已知限制：
+
+- **不能 steer。** 正在跑时 `wk send <ctx> "..."` 返回 exit 13。等 turn 结束后再续聊。
+- **不支持 rewind / fork。** agy 不接受调用方指定的新会话 ID，`rollback()` 直接失败。
+- **Ask 模式 result 为空。** `--sandbox` 下 agy 可以报 SUCCESS，但 `response` 是空字符串。wk 会把这个 turn 记成完成且没有正文。
+- **原生历史导不进来。** `~/.gemini/antigravity-cli/conversation_summaries.db` 能列出标题、预览、工作区和时间；每段对话的 `steps` 表是没有公开 schema 的 protobuf，采纳后的 turn 列表是空的。wk 自己跑过的会话仍以 wk 的 transcript 为准。
+- **斜杠命令不从项目目录探测。** agy 的命令在自己的插件树里，composer 只保留跨工具的 `.agents/skills`。

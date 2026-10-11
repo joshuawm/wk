@@ -228,3 +228,27 @@ fake 层(同日):`run-e2e-windows.sh` 93/93(T11 SIGINT 设计性 SKIP,
 待 Windows Terminal 手动 Ctrl+C 验证);unix 回归 fake 94/94。
 
 细节与实现约束见 [wk-windows.md](wk-windows.md)。
+
+---
+
+## Antigravity（agy）手工实测（2026-10-11）
+
+对照 CLI：本机 `agy` 1.3.1（stream-json）。二进制在 PATH 上；本环境把 `agy` 软链到 `/data/.memoh/deps/bin/`，与 `grok` 相同。提交 `0430833` 之后用 `wk run agy` / `wk send` 手工跑，没有进 `run-real-windows.sh`。
+
+| 测试 | 结果 |
+|---|---|
+| 单轮问答（`--mode full-access`） | 通过。回复「BANANA」 |
+| 多轮上下文（`wk send` 跟问） | 通过。记住前文 |
+| 工具调用（创建文件） | 通过。`hello.txt`、`probe2.txt` 落盘，result 返回带链接的完整回复 |
+| `--model gemini-3.1-pro-high` | 通过。自报 Gemini 3.1 Pro |
+| `--mode ask`（`--sandbox`） | 会话完成，result 为空。agy 报 SUCCESS 但 `response` 为空 |
+| 会话发现（`conversation_summaries.db`） | 列表路径可编译、可运行。采纳后的 turn 历史为空（见下） |
+
+限制（与代码一致，不是这次实测的回归）：
+
+1. rewind / fork 不支持。agy 自己生成会话 ID，driver 的 `rollback()` 直接失败。
+2. Ask 模式 result 为空。`--sandbox` 下工具被静默拒绝时，wk 仍把 turn 记成完成。纯问答用 `full-access`。
+3. 历史导入为空。summaries 库有标题、预览、工作区和时间戳；`steps` 是无公开 schema 的 protobuf，`provider_session_history` 返回空 history。
+4. `cargo test -p waku-core --lib` 编不过，缺 `waku_client`。干净 HEAD 上就这样，与 agy 改动无关。这次没有用该 crate 的单测代替上面的端到端实测。
+
+使用说明见 [wk-help.md](wk-help.md) 的「Antigravity（agy）」一节。

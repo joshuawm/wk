@@ -307,10 +307,24 @@ task 进入终态后，driver 保留 10min（可配置），用于快速续聊�
 | OpenCode | 是 | 是 | 是 |
 | Amp | 否 | 否 | 否 |
 | Pi / OhMyPi | 否 | 否 | 否 |
+| Antigravity（agy） | 否 | 否 | 否（`respond` 为空操作） |
 
-对于不发出请求的 provider，`--mode ask` 的实际行为待核实。如果它们会在 provider 内部静默卡住，`run` 时应拒绝 `--mode ask` 并返回 `invalid-mode`。
+Amp / Pi / OhMyPi 在 `--mode ask` 上直接 `invalid-mode`。Antigravity 接受 ask，但映射成 `agy --sandbox`：进程以 SUCCESS 结束时 `response` 经常为空，wk 仍记 `completed`。纯问答请使用 `full-access`（或 `auto` / `auto-accept-edits`），这三档都传 `--dangerously-skip-permissions`。print 模式没有交互式授权通道。
 
-`supports_steer()` 在运行时查询，不要硬编码。
+`supports_steer()` 在运行时查询，不要硬编码。Antigravity 的实现返回 `false`：排队的 stdin 消息要等当前 turn 结束，对 wk 来说就是拒绝 steer（exit 13）。
+
+### Antigravity driver
+
+实现在 `waku-core::driver::agy`。一个会话一个长驻 `agy` 进程，stdin/stdout 都是 NDJSON：
+
+- stdin：`{"event":"user","message":{...}}`，一行一个 turn。
+- stdout：`init`（带 `conversation_id`）、`step_update`（`user_input` / `agent_response` / `tool`）、`result`（`status` + `response` + `usage`）。
+
+`init` 里的 id 写成 `ProviderResumeCursor::Antigravity`。续跑用 `--conversation <id>`。`rollback()` 返回错误：agy 不接受调用方指定的会话 ID，wk 的 rewind/fork 语义做不到。`ProviderKind::supports_conversation_rollback` 仍把 Antigravity 列在支持集合里，调用时以 driver 的错误为准。
+
+会话发现读 `~/.gemini/antigravity-cli/conversation_summaries.db`（只读，纯文本列：title / preview / workspace_uris / 时间戳）。`provider_session_history` 固定返回空 history：对应 `conversations/<uuid>.db` 的 `steps` 表是无公开 schema 的 protobuf。wk 自己发起的任务继续用自己的 transcript。
+
+模型发现跑 `agy models`，解析 `id<TAB>display`。斜杠命令目录不探测（插件不在项目树里）。
 
 ## 12. 安全
 
