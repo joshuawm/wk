@@ -530,6 +530,9 @@ impl Backend for WakuBackend {
                     }
                     ProviderKind::Grok => crate::grok_session::list_provider_sessions(limit)?,
                     ProviderKind::Kimi => crate::kimi_session::list_provider_sessions(limit)?,
+                    ProviderKind::Antigravity => {
+                        crate::antigravity_session::list_provider_sessions(limit)?
+                    }
                     ProviderKind::OhMyPi | ProviderKind::Pi => {
                         crate::pi_session::list_provider_sessions(provider, limit)?
                     }
@@ -604,6 +607,14 @@ impl Backend for WakuBackend {
                             &binary,
                             &cwd,
                             session_id,
+                            VISIBLE_TURN_LIMIT,
+                        )?
+                    }
+                    // agy stores turns in its own SQLite database; history
+                    // import shares that reader with session discovery.
+                    ProviderResumeCursor::Antigravity { conversation_id } => {
+                        crate::antigravity_session::provider_session_history(
+                            conversation_id,
                             VISIBLE_TURN_LIMIT,
                         )?
                     }
@@ -1217,7 +1228,8 @@ impl WakuBackend {
                 })?;
                 Ok((fork.cursor, fork.message_ids))
             }
-            ProviderKind::Codex
+            ProviderKind::Antigravity
+            | ProviderKind::Codex
             | ProviderKind::DeepSeek
             | ProviderKind::OhMyPi
             | ProviderKind::Pi => Ok((
@@ -1471,7 +1483,8 @@ impl WakuBackend {
                 .cursor;
                 Ok((Some(cursor), HashMap::new(), false))
             }
-            ProviderKind::Codex
+            ProviderKind::Antigravity
+            | ProviderKind::Codex
             | ProviderKind::DeepSeek
             | ProviderKind::OhMyPi
             | ProviderKind::Pi => Ok((

@@ -23,6 +23,14 @@ const CURSOR_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
     match provider {
+        ProviderKind::Antigravity => [
+            ProviderModel::new("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)").default(),
+            ProviderModel::new("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
+            ProviderModel::new("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)"),
+            ProviderModel::new("gemini-3.1-pro-low", "Gemini 3.1 Pro (Low)"),
+        ]
+        .into_iter()
+        .collect(),
         ProviderKind::Amp => [
             ProviderModel::new("low", tr!("model_option.low")),
             ProviderModel::new("medium", tr!("model_option.medium")).default(),
@@ -129,6 +137,7 @@ pub fn discover_catalog(
         // Amp exposes stable agent modes rather than a model inventory. Keep
         // the picker aligned with the modes advertised by the current CLI.
         ProviderKind::Amp => (Vec::new(), None),
+        ProviderKind::Antigravity => (discover_antigravity_models(binary), None),
         ProviderKind::Codex => (discover_codex_models(binary), None),
         ProviderKind::Claude => (discover_claude_models(binary), None),
         ProviderKind::Cursor => (discover_cursor_models(binary), None),
@@ -902,6 +911,48 @@ fn parse_grok_models(output: &str) -> Vec<ProviderModel> {
             let mut model = ProviderModel::new(id, display_name_from_slug(id));
             model.is_default = default_model.as_deref() == Some(id);
             Some(grok_reasoning_model(model))
+        })
+        .collect()
+}
+
+/// Antigravity (agy) prints its catalog as tab-separated `id<TAB>display`
+/// lines after a "Fetching available models..." banner. Reasoning effort is
+/// baked into the model id (`-low`/`-medium`/`-high` suffixes), so each entry
+/// is a standalone model with no separate effort options.
+fn discover_antigravity_models(binary: &Path) -> Vec<ProviderModel> {
+    let mut command = crate::command_env::command(binary);
+    let command = command.arg("models");
+    let Ok(output) = crate::command_env::output(command) else {
+        return Vec::new();
+    };
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_antigravity_models(&combined)
+}
+
+fn parse_antigravity_models(output: &str) -> Vec<ProviderModel> {
+    let cleaned = strip_ansi(output);
+    cleaned
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (id, display) = line.split_once('\t')?;
+            let id = id.trim();
+            if id.is_empty() || id.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let display = display.trim();
+            Some(ProviderModel::new(
+                id,
+                if display.is_empty() {
+                    display_name_from_slug(id)
+                } else {
+                    display.to_owned()
+                },
+            ))
         })
         .collect()
 }

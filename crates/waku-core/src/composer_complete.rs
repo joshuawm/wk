@@ -318,6 +318,9 @@ fn assemble_slash_commands(
                 scan_skill_files(provider, &home.join(".config/agents/skills"), &mut commands);
             }
         }
+        // agy loads skills from its own plugin tree rather than project
+        // files, so only the cross-tool standard applies.
+        ProviderKind::Antigravity => {}
         // Harness commands are session-scoped and reported live by the Host,
         // and Kimi Code likewise publishes its whole command set over ACP
         // rather than from files Waku could scan.

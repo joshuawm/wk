@@ -40,7 +40,10 @@ pub(crate) fn discover(
         // requires an agent id for commands/list. Creating throwaway sessions
         // merely to seed autocomplete would pollute provider history, so their
         // live DriverEvent::AvailableCommands update is the catalog surface.
-        ProviderKind::Cursor
+        // agy loads its slash commands from plugins, none of which live in
+        // the project tree.
+        ProviderKind::Antigravity
+        | ProviderKind::Cursor
         | ProviderKind::DeepSeek
         | ProviderKind::Fx
         | ProviderKind::Grok

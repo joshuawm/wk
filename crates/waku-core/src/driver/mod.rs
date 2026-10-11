@@ -2,6 +2,7 @@
 
 mod acp;
 mod activity;
+mod agy;
 mod amp;
 mod claude;
 mod codex;
@@ -233,6 +234,10 @@ pub fn start_local(
             Arc::new(acp::AcpDriver::start(provider, options, events)?)
         }
         ProviderKind::DeepSeek => Arc::new(deepseek::DeepSeekDriver::start(options, events)?),
+        // Antigravity (agy) speaks the same stdin-streaming transport as
+        // Claude — one long-lived process per conversation — but with its own
+        // NDJSON event vocabulary (see `driver::agy`).
+        ProviderKind::Antigravity => Arc::new(agy::AntigravityDriver::start(options, events)?),
         // OpenCode is not a per-workspace server: one adopted background
         // service carries every workspace, and every Waku task rides its one
         // event stream.

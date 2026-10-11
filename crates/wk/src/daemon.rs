@@ -141,6 +141,7 @@ pub fn now_secs() -> i64 {
 pub fn parse_provider(name: &str) -> Option<ProviderKind> {
     match name.to_ascii_lowercase().as_str() {
         "amp" => Some(ProviderKind::Amp),
+        "antigravity" | "agy" => Some(ProviderKind::Antigravity),
         "claude" => Some(ProviderKind::Claude),
         "codex" => Some(ProviderKind::Codex),
         "cursor" => Some(ProviderKind::Cursor),

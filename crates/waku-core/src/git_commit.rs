@@ -253,6 +253,16 @@ fn agent_arguments(
             push(&mut args, "--effort");
             push(&mut args, CLAUDE_COMMIT_EFFORT);
         }
+        // agy has no per-flag tool kill switch; the commit prompt itself
+        // forbids tool use, and `--sandbox` keeps the one-shot read-only.
+        ProviderKind::Antigravity => {
+            push(&mut args, "--sandbox");
+            push(&mut args, "--disable-slash-commands");
+            if let Some(model) = model {
+                push(&mut args, "--model");
+                push(&mut args, model);
+            }
+        }
         ProviderKind::Codex => {
             push(&mut args, "exec");
             push(&mut args, "--sandbox");
@@ -806,6 +816,12 @@ mod tests {
                     assert!(has_pair(&args, "--prompt", prompt));
                     assert!(has_pair(&args, "--output-format", "text"));
                     assert!(has_pair(&args, "--model", "model"));
+                }
+                ProviderKind::Antigravity => {
+                    assert!(has(&args, "--sandbox"));
+                    assert!(has(&args, "--disable-slash-commands"));
+                    assert!(has_pair(&args, "--model", "model"));
+                    assert!(!args.iter().any(|arg| arg == "--effort"));
                 }
             }
         }
