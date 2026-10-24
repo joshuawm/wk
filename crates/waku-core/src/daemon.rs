@@ -96,12 +96,6 @@ impl WakuBackend {
         })
     }
 
-    #[cfg(all(test, unix))]
-    pub(crate) fn with_terminal_shell(mut self, shell: alacritty_terminal::tty::Shell) -> Self {
-        self.terminal_shell = Some(shell);
-        self
-    }
-
     fn open_terminal(
         &self,
         cwd: &Path,
