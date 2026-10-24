@@ -1539,7 +1539,7 @@ fn pump_loop(
                     }
                 }
             }
-            DriverEvent::TurnFinished { success, .. } => {
+            DriverEvent::TurnFinished { success, summary } => {
                 let terminal = state
                     .ctxs
                     .get_mut(&context_id)
@@ -1548,7 +1548,9 @@ fn pump_loop(
                     .map(|task| {
                         task.state = if success { "completed" } else { "failed" }.into();
                         if task.state == "failed" && task.error.is_none() {
-                            task.error = Some("the provider ended the turn with an error".into());
+                            task.error = Some(summary.unwrap_or_else(|| {
+                                "the provider ended the turn with an error".into()
+                            }));
                         }
                         task.finished_at = Some(now_secs());
                     });

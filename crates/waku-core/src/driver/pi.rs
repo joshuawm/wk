@@ -1266,6 +1266,10 @@ struct PiStreamState {
     message_saw_text: bool,
     message_saw_reasoning: bool,
     failed: bool,
+    /// Pi reports a broken provider stream by ending the assistant message with
+    /// `stopReason: "error"` instead of raising an `error` event, so the reason
+    /// is carried here to settle the turn and to keep it as the failure text.
+    failure: Option<String>,
     tools: HashMap<String, (ActivityKind, String)>,
 }
 
@@ -1364,15 +1368,15 @@ fn handle_pi_message(
                 .lock()
                 .retain(|_, response| matches!(response, PendingResponse::Request(_)));
             let success = !state.failed;
-            let _ = events.send(DriverEvent::TurnFinished {
-                success,
-                summary: (!success).then(|| {
+            let summary = (!success).then(|| {
+                state.failure.clone().unwrap_or_else(|| {
                     tr!(
                         "errors.provider_complete_turn",
                         provider = flavor.display_name()
                     )
-                }),
+                })
             });
+            let _ = events.send(DriverEvent::TurnFinished { success, summary });
         }
         *state = PiStreamState::default();
         return;
@@ -1432,7 +1436,9 @@ fn handle_pi_message(
                 }
                 Some("error") => {
                     state.failed = true;
-                    let _ = events.send(DriverEvent::Error(pi_error_message(flavor, update)));
+                    let message = pi_error_message(flavor, update);
+                    state.failure = Some(message.clone());
+                    let _ = events.send(DriverEvent::Error(message));
                 }
                 _ => {}
             }
@@ -1447,7 +1453,13 @@ fn handle_pi_message(
                         context_window: None,
                     });
                 }
+                note_pi_message_outcome(flavor, value.get("message"), events, state);
                 emit_completed_message_fallback(value.get("message"), events, state);
+            }
+        }
+        "turn_end" => {
+            if value.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
+                note_pi_message_outcome(flavor, value.get("message"), events, state);
             }
         }
         "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
@@ -1504,6 +1516,8 @@ fn handle_pi_message(
         "auto_retry_end" => {
             if value.get("success").and_then(Value::as_bool) == Some(true) {
                 state.failed = false;
+                // A retry that recovered replaces the error that started it.
+                state.failure = None;
             } else {
                 state.failed = true;
                 let message = value
@@ -1513,6 +1527,7 @@ fn handle_pi_message(
                     .unwrap_or_else(|| {
                         format!("{} exhausted its automatic retries", flavor.display_name())
                     });
+                state.failure = Some(message.clone());
                 let _ = events.send(DriverEvent::Error(message));
             }
         }
@@ -1544,6 +1559,35 @@ fn publish_commands(
         })
         .collect();
     let _ = events.send(DriverEvent::AvailableCommands(commands));
+}
+
+/// Records a turn that Pi finished in an error state.
+///
+/// A provider stream that breaks mid-response is not reported through an
+/// `error` assistant event: Pi closes the assistant message with
+/// `stopReason: "error"` and the transport reason in `errorMessage`, then
+/// still settles the agent normally. Reading only the event type therefore
+/// settles such a turn as successful and loses the reason.
+fn note_pi_message_outcome(
+    flavor: PiFlavor,
+    message: Option<&Value>,
+    events: &impl DriverEventSink,
+    state: &mut PiStreamState,
+) {
+    let Some(message) = message else {
+        return;
+    };
+    if message.get("stopReason").and_then(Value::as_str) != Some("error") {
+        return;
+    }
+    state.failed = true;
+    let error = pi_error_message(flavor, message);
+    // `message_end` and `turn_end` both carry the same message.
+    if state.failure.as_deref() == Some(error.as_str()) {
+        return;
+    }
+    state.failure = Some(error.clone());
+    let _ = events.send(DriverEvent::Error(error));
 }
 
 fn emit_completed_message_fallback(
@@ -1989,6 +2033,69 @@ mod tests {
         assert!(matches!(
             event_rx.recv().unwrap(),
             DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// A provider stream that breaks mid-response reaches Pi without an
+    /// `error` event: the assistant message just ends with
+    /// `stopReason: "error"`. The turn has to settle as failed and report why,
+    /// otherwise a truncated turn looks like a short successful one.
+    #[test]
+    fn broken_stream_settles_as_failed_with_the_transport_reason() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+        for value in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "I'll start by reading the charter"}
+            }),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "I'll start by reading the charter"}],
+                    "stopReason": "error",
+                    "errorMessage": "Error reading response: malformed server-sent event JSON."
+                }
+            }),
+            json!({
+                "type": "turn_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "I'll start by reading the charter"}],
+                    "stopReason": "error",
+                    "errorMessage": "Error reading response: malformed server-sent event JSON."
+                }
+            }),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(
+                PiFlavor::Pi,
+                value,
+                &pending,
+                &commands,
+                &events,
+                &mut state,
+            );
+        }
+
+        assert!(matches!(event_rx.recv().unwrap(), DriverEvent::TurnStarted));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TextDelta(value) if value == "I'll start by reading the charter"
+        ));
+        // Exactly once, even though `message_end` and `turn_end` repeat it.
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::Error(value) if value.contains("malformed server-sent event JSON")
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            DriverEvent::TurnFinished { success: false, summary: Some(summary) }
+                if summary.contains("malformed server-sent event JSON")
         ));
         assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
     }
